@@ -26,3 +26,9 @@
 - Developed a 6-way weighted probability spreading algorithm that prioritizes damp, nutrient-dense neighbor cells.
 - Enforced a hard environmental constraint preventing fungal expansion into bone-dry (`Moisture = 0`) voxels.
 - Isolated fungal growth simulations into a dedicated loop sweep to prevent early-exit water logic from freezing dry fungal colonies.
+
+## [2026-07-12] - Phase 4 Complete (GPU MultiMesh Optimization)
+- Refactored the voxel rendering pipeline from an individual Node3D pool to a single `MultiMeshInstance3D`.
+- Collapsed 8,000 independent draw calls and material allocations down to a single GPU instancing operation.
+- Implemented per-instance vertex coloring by enabling `VertexColorUseAsAlbedo` on a shared material.
+- Managed voxel visibility dynamically by driving instance color alpha channels to 0, eliminating scene-tree allocation churn.

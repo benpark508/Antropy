@@ -72,7 +72,7 @@ public partial class VoxelGrid : Node3D
 
     private float _tickAccumulator;
 
-    private MeshInstance3D[] _debugInstances;
+    private MultiMesh _debugMultiMesh;
 
     private RandomNumberGenerator _fungalRng;
 
@@ -455,36 +455,45 @@ public partial class VoxelGrid : Node3D
         }
     }
 
+    // Single MultiMeshInstance3D standing in for the old 8,000-node
+    // MeshInstance3D pool: one draw call and one shared material instead of
+    // 8,000 of each. Per-cell transforms never change after spawn (grid
+    // geometry is static), so they're written once here; only per-instance
+    // color is touched on the simulation tick's visual update pass.
     private void SpawnDebugVisualization()
     {
-        var debugRoot = new Node3D { Name = "DebugMoistureVisualization" };
-        AddChild(debugRoot);
-
         var boxMesh = new BoxMesh { Size = Vector3.One * CellSize * 0.9f };
-        _debugInstances = new MeshInstance3D[_cells.Length];
 
-        // One instance per grid cell, all sharing the same BoxMesh resource.
-        // Ticks toggle Visible/AlbedoColor on these existing nodes instead of
-        // tearing down and rebuilding the tree every SimulationTickRate.
+        _debugMultiMesh = new MultiMesh
+        {
+            TransformFormat = MultiMesh.TransformFormatEnum.Transform3D,
+            UseColors = true,
+            Mesh = boxMesh,
+            InstanceCount = _cells.Length
+        };
+
+        var multiMeshInstance = new MultiMeshInstance3D
+        {
+            Name = "DebugMoistureVisualization",
+            Multimesh = _debugMultiMesh,
+            MaterialOverride = new StandardMaterial3D
+            {
+                ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
+                Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
+                VertexColorUseAsAlbedo = true
+            }
+        };
+        AddChild(multiMeshInstance);
+
         for (int z = 0; z < Depth; z++)
         {
             for (int y = 0; y < Height; y++)
             {
                 for (int x = 0; x < Width; x++)
                 {
-                    var meshInstance = new MeshInstance3D
-                    {
-                        Mesh = boxMesh,
-                        Position = new Vector3(x, y, z) * CellSize,
-                        MaterialOverride = new StandardMaterial3D
-                        {
-                            ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
-                            Transparency = BaseMaterial3D.TransparencyEnum.Alpha
-                        }
-                    };
-
-                    debugRoot.AddChild(meshInstance);
-                    _debugInstances[GetIndex(x, y, z)] = meshInstance;
+                    int index = GetIndex(x, y, z);
+                    var transform = new Transform3D(Basis.Identity, new Vector3(x, y, z) * CellSize);
+                    _debugMultiMesh.SetInstanceTransform(index, transform);
                 }
             }
         }
@@ -497,16 +506,14 @@ public partial class VoxelGrid : Node3D
         for (int i = 0; i < _cells.Length; i++)
         {
             var cell = _cells[i];
-            var meshInstance = _debugInstances[i];
 
+            // MultiMesh instances have no per-instance Visible flag, so
+            // "invisible" is expressed as alpha 0 against the shared
+            // Alpha-transparency material rather than a toggled bool.
             bool visible = cell.Moisture >= MoistureVisibilityThreshold;
-            meshInstance.Visible = visible;
+            float alpha = visible ? cell.Moisture / 100.0f : 0.0f;
 
-            if (visible)
-            {
-                var material = (StandardMaterial3D)meshInstance.MaterialOverride;
-                material.AlbedoColor = new Color(0.15f, 0.45f, 0.95f, cell.Moisture / 100.0f);
-            }
+            _debugMultiMesh.SetInstanceColor(i, new Color(0.15f, 0.45f, 0.95f, alpha));
         }
     }
 }
