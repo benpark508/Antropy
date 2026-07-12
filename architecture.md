@@ -9,6 +9,7 @@
   * int Carbon (0 to 100)
   * int Phosphorus (0 to 100)
   * bool FungalPresence
+  * Carbon/Phosphorus range clamp shared with Moisture's `MaxMoisture` value via a parallel `MaxNutrient = 100` constant.
 
 ## 1a. Mouse Interaction Brush (Phase 2B)
 - File Path: game/VoxelInteractor.cs
@@ -34,3 +35,10 @@
   2. **Horizontal Equalization**: Any moisture that couldn't go down (off-grid at `y=0`, or the cell below is saturated) is split evenly across whichever in-bounds N/S/E/W neighbors exist (mapped to Z-/Z+/X+/X-).
   3. **Safety Clamp**: After all cells are processed, the write buffer is clamped to `[0, MaxMoisture]` to guard against concurrent horizontal inflows stacking above capacity.
 - Debug Visualization — Persistent Mesh Instance Pool: One `MeshInstance3D` per grid cell is allocated once (sharing a single `BoxMesh` resource), rather than rebuilt every tick. Each simulation tick only toggles `Visible` and updates `AlbedoColor` alpha (moisture-driven) on the existing pooled instances, keeping a 10Hz simulation update cheap on an 8,000-cell grid.
+
+## 4. Nutrient Diffusion & Leaching (Phase 3A)
+- File Path: game/VoxelGrid.cs
+- Runs inside the same `SimulateWaterFlow()` tick as the water CA above, against the same `_cells` (read) / `_cellsBuffer` (write) double buffer — no separate tick loop or extra buffer pair.
+- **Leaching (advection)** — `LeachNutrients()`: Whenever gravity or horizontal equalization moves `waterMoved` units of moisture out of a cell (out of that cell's pre-tick `totalMoisture`), a proportional slice of that cell's pre-tick Carbon and Phosphorus rides along into the same destination cell: `leached = round(nutrient * (waterMoved / totalMoisture) * LeachingEfficiency)`. `LeachingEfficiency` (export, default 0.5) models that not all dissolved nutrient is mobile enough to leach out in one tick. Because gravity's `downOutflow` and horizontal's `share` are both fractions of the same original `totalMoisture`, and their sum never exceeds it, total leached nutrient per source cell per tick can't exceed what the cell held.
+- **Diffusion (concentration gradient)** — `DiffuseNutrients()` / `TryDiffuseToNeighbor()`: Runs unconditionally for every cell with any moisture, independent of whether bulk water moved this tick, against all six neighbors (including up/down — the only nutrient pathway that ever crosses upward, since gravity is one-way). Transfer requires both the source and neighbor cell to hold at least `MinMoistureForDiffusion` moisture (export, default 1) to act as the transport medium; a bone-dry cell neither pushes nor receives nutrient via diffusion. Flux is `round((sourceValue - neighborValue) * NutrientDiffusionRate)` (export, default 0.1), computed only when positive — each cell only pushes toward a neighbor it's more concentrated than. Since every pair of neighbors is evaluated from both sides in the same tick against the same pre-tick snapshot, only the higher-concentration side ever produces a positive flux, so a given pair transfers at most once per tick with no double-counting.
+- **Safety Clamp**: The existing end-of-tick clamp pass was extended to also clamp `Carbon`/`Phosphorus` to `[0, MaxNutrient]`, covering the (normally impossible, but rounding-adjacent) case of a cell receiving simultaneous leached + diffused inflow from multiple neighbors in one tick.

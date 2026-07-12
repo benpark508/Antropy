@@ -14,6 +14,7 @@ public partial class VoxelGrid : Node3D
     public const int Height = 20;
     public const int Depth = 20;
     public const int MaxMoisture = 100;
+    public const int MaxNutrient = 100;
 
     [Export] public float CellSize = 1.0f;
     [Export] public int MoistureVisibilityThreshold = 40;
@@ -21,6 +22,22 @@ public partial class VoxelGrid : Node3D
     // Interval between simulation ticks. Decoupling the CA update from
     // _Process's frame rate keeps flow speed constant regardless of FPS.
     [Export] public float SimulationTickRate = 0.1f;
+
+    // Fraction of a cell's dissolved Carbon/Phosphorus that leaches out per
+    // unit of moisture that physically flows out of the cell this tick (see
+    // LeachNutrients). Not all nutrient bound in soil water is mobile enough
+    // to leach in one tick, hence < 1.0.
+    [Export] public float LeachingEfficiency = 0.5f;
+
+    // Fraction of the Carbon/Phosphorus concentration gap between a cell and
+    // a neighbor that equalizes per tick via chemical diffusion, independent
+    // of bulk water flow (see DiffuseNutrients).
+    [Export] public float NutrientDiffusionRate = 0.1f;
+
+    // Minimum moisture required in BOTH a cell and its neighbor for chemical
+    // diffusion to occur between them — nutrients need a wet medium to
+    // migrate through even when no bulk water is flowing.
+    [Export] public int MinMoistureForDiffusion = 1;
 
     private VoxelCell[] _cells;
 
@@ -89,8 +106,9 @@ public partial class VoxelGrid : Node3D
         return true;
     }
 
-    // Runs one CA tick of water movement, reading exclusively from _cells
-    // and writing exclusively to _cellsBuffer, then swaps the buffers.
+    // Runs one CA tick of water movement plus nutrient leaching/diffusion,
+    // reading exclusively from _cells and writing exclusively to
+    // _cellsBuffer, then swaps the buffers.
     private void SimulateWaterFlow()
     {
         // Seed the write buffer with the current state so untouched fields
@@ -109,6 +127,9 @@ public partial class VoxelGrid : Node3D
                     if (moisture <= 0)
                         continue;
 
+                    int cellCarbon = _cells[index].Carbon;
+                    int cellPhosphorus = _cells[index].Phosphorus;
+
                     int downOutflow = 0;
                     bool hasBelow = IsInBounds(x, y - 1, z);
 
@@ -122,8 +143,17 @@ public partial class VoxelGrid : Node3D
                             downOutflow = Mathf.Min(moisture, belowCapacity);
                             _cellsBuffer[index].Moisture -= downOutflow;
                             _cellsBuffer[belowIndex].Moisture += downOutflow;
+
+                            // Leaching: the water carries a proportional
+                            // slice of this cell's dissolved nutrients with it.
+                            LeachNutrients(index, belowIndex, cellCarbon, cellPhosphorus, downOutflow, moisture);
                         }
                     }
+
+                    // Chemical diffusion runs every tick regardless of bulk
+                    // flow above, against all six neighbors (including up,
+                    // which gravity and equalization never target).
+                    DiffuseNutrients(index, x, y, z, moisture);
 
                     int remaining = moisture - downOutflow;
                     if (remaining <= 0)
@@ -150,22 +180,30 @@ public partial class VoxelGrid : Node3D
 
                     if (hasNorth)
                     {
-                        _cellsBuffer[GetIndex(x, y, z - 1)].Moisture += share;
+                        int northIndex = GetIndex(x, y, z - 1);
+                        _cellsBuffer[northIndex].Moisture += share;
+                        LeachNutrients(index, northIndex, cellCarbon, cellPhosphorus, share, moisture);
                         distributed += share;
                     }
                     if (hasSouth)
                     {
-                        _cellsBuffer[GetIndex(x, y, z + 1)].Moisture += share;
+                        int southIndex = GetIndex(x, y, z + 1);
+                        _cellsBuffer[southIndex].Moisture += share;
+                        LeachNutrients(index, southIndex, cellCarbon, cellPhosphorus, share, moisture);
                         distributed += share;
                     }
                     if (hasEast)
                     {
-                        _cellsBuffer[GetIndex(x + 1, y, z)].Moisture += share;
+                        int eastIndex = GetIndex(x + 1, y, z);
+                        _cellsBuffer[eastIndex].Moisture += share;
+                        LeachNutrients(index, eastIndex, cellCarbon, cellPhosphorus, share, moisture);
                         distributed += share;
                     }
                     if (hasWest)
                     {
-                        _cellsBuffer[GetIndex(x - 1, y, z)].Moisture += share;
+                        int westIndex = GetIndex(x - 1, y, z);
+                        _cellsBuffer[westIndex].Moisture += share;
+                        LeachNutrients(index, westIndex, cellCarbon, cellPhosphorus, share, moisture);
                         distributed += share;
                     }
 
@@ -174,17 +212,103 @@ public partial class VoxelGrid : Node3D
             }
         }
 
-        // Horizontal spreading doesn't check a destination's headroom
-        // against concurrent inflow from its other neighbors, so clamp as a
-        // safety net before the buffer becomes the new authoritative state.
+        // Horizontal spreading and diffusion don't check a destination's
+        // headroom against concurrent inflow from its other neighbors, so
+        // clamp as a safety net before the buffer becomes the new
+        // authoritative state.
         for (int i = 0; i < _cellsBuffer.Length; i++)
         {
-            int clamped = Mathf.Clamp(_cellsBuffer[i].Moisture, 0, MaxMoisture);
-            _cellsBuffer[i].Moisture = clamped;
+            _cellsBuffer[i].Moisture = Mathf.Clamp(_cellsBuffer[i].Moisture, 0, MaxMoisture);
+            _cellsBuffer[i].Carbon = Mathf.Clamp(_cellsBuffer[i].Carbon, 0, MaxNutrient);
+            _cellsBuffer[i].Phosphorus = Mathf.Clamp(_cellsBuffer[i].Phosphorus, 0, MaxNutrient);
         }
 
         (_cells, _cellsBuffer) = (_cellsBuffer, _cells);
         UpdateDebugVisualization();
+    }
+
+    // Moves a proportional slice of Carbon/Phosphorus from source to
+    // destination alongside a bulk water transfer of `waterMoved` units out
+    // of the source cell's original `totalMoisture`. Nutrients are treated
+    // as uniformly dissolved through the cell's moisture, so the fraction of
+    // moisture leaving the cell carries that same fraction of each nutrient,
+    // damped by LeachingEfficiency.
+    private void LeachNutrients(int sourceIndex, int destIndex, int sourceCarbon, int sourcePhosphorus, int waterMoved, int totalMoisture)
+    {
+        int carbonLeached = ComputeLeachedAmount(sourceCarbon, waterMoved, totalMoisture);
+        if (carbonLeached > 0)
+        {
+            _cellsBuffer[sourceIndex].Carbon -= carbonLeached;
+            _cellsBuffer[destIndex].Carbon += carbonLeached;
+        }
+
+        int phosphorusLeached = ComputeLeachedAmount(sourcePhosphorus, waterMoved, totalMoisture);
+        if (phosphorusLeached > 0)
+        {
+            _cellsBuffer[sourceIndex].Phosphorus -= phosphorusLeached;
+            _cellsBuffer[destIndex].Phosphorus += phosphorusLeached;
+        }
+    }
+
+    private int ComputeLeachedAmount(int nutrientAmount, int waterMoved, int totalMoisture)
+    {
+        if (nutrientAmount <= 0 || waterMoved <= 0 || totalMoisture <= 0)
+            return 0;
+
+        float fraction = (float)waterMoved / totalMoisture;
+        int leached = Mathf.RoundToInt(nutrientAmount * fraction * LeachingEfficiency);
+        return Mathf.Clamp(leached, 0, nutrientAmount);
+    }
+
+    // Slowly equalizes Carbon/Phosphorus concentration against all six
+    // neighbors regardless of bulk water movement this tick, gated by both
+    // cells holding at least MinMoistureForDiffusion moisture to act as the
+    // transport medium. Each cell only ever pushes toward a neighbor it is
+    // MORE concentrated than, so a given pair transfers in at most one
+    // direction per tick even though both ends independently evaluate it.
+    private void DiffuseNutrients(int index, int x, int y, int z, int moisture)
+    {
+        TryDiffuseToNeighbor(index, moisture, x - 1, y, z);
+        TryDiffuseToNeighbor(index, moisture, x + 1, y, z);
+        TryDiffuseToNeighbor(index, moisture, x, y - 1, z);
+        TryDiffuseToNeighbor(index, moisture, x, y + 1, z);
+        TryDiffuseToNeighbor(index, moisture, x, y, z - 1);
+        TryDiffuseToNeighbor(index, moisture, x, y, z + 1);
+    }
+
+    private void TryDiffuseToNeighbor(int index, int moisture, int nx, int ny, int nz)
+    {
+        if (!IsInBounds(nx, ny, nz))
+            return;
+
+        int neighborIndex = GetIndex(nx, ny, nz);
+        int neighborMoisture = _cells[neighborIndex].Moisture;
+
+        if (moisture < MinMoistureForDiffusion || neighborMoisture < MinMoistureForDiffusion)
+            return;
+
+        int carbonFlux = ComputeDiffusionFlux(_cells[index].Carbon, _cells[neighborIndex].Carbon);
+        if (carbonFlux > 0)
+        {
+            _cellsBuffer[index].Carbon -= carbonFlux;
+            _cellsBuffer[neighborIndex].Carbon += carbonFlux;
+        }
+
+        int phosphorusFlux = ComputeDiffusionFlux(_cells[index].Phosphorus, _cells[neighborIndex].Phosphorus);
+        if (phosphorusFlux > 0)
+        {
+            _cellsBuffer[index].Phosphorus -= phosphorusFlux;
+            _cellsBuffer[neighborIndex].Phosphorus += phosphorusFlux;
+        }
+    }
+
+    private int ComputeDiffusionFlux(int sourceValue, int neighborValue)
+    {
+        int gradient = sourceValue - neighborValue;
+        if (gradient <= 0)
+            return 0;
+
+        return Mathf.RoundToInt(gradient * NutrientDiffusionRate);
     }
 
     private void PopulateBaseline()
