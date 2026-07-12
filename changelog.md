@@ -1,3 +1,10 @@
+## [2026-07-12] - Phase 2B Complete
+- Added `VoxelInteractor.cs`: a left-click mouse brush for stress-testing the water CA.
+- Implemented ray/grid-AABB intersection via the slab method, using the camera's active `ProjectRayOrigin`/`ProjectRayNormal`.
+- Left-Click injects `Moisture = 100`; Shift + Left-Click drains to `Moisture = 0`; both support click-and-hold painting.
+- Writes go directly into `VoxelGrid`'s authoritative `_cells` array, leaving the existing tick loop and mesh instance pool to handle visualization — no changes to `CadCameraController`'s Right-click orbit / Middle-click pan.
+- Fixed Top View clicks always resolving to the topmost, permanently-dry ceiling layer (gravity only pulls moisture down, so nothing refills it): the ray now marches inward from the AABB entry point and targets the first cell actually above the debug-visibility threshold, falling back to the entry cell only when the whole ray path is dry.
+
 ## [2026-07-12] - Phase 1 Complete (Unified Perspective Refinement)
 - Refactored CAD camera snapping system to remain in Perspective mode at all times.
 - Eliminated true Orthogonal projection to prevent visual depth discontinuities.

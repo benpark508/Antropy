@@ -10,6 +10,15 @@
   * int Phosphorus (0 to 100)
   * bool FungalPresence
 
+## 1a. Mouse Interaction Brush (Phase 2B)
+- File Path: game/VoxelInteractor.cs
+- Ray-to-Grid Intersection: Every frame, resolves `GetViewport().GetCamera3D().ProjectRayOrigin/Normal()` for the current mouse position, transforms the ray into `VoxelGrid`'s local space, and intersects it against the grid's AABB via the slab method. The AABB is built around the debug mesh instances' actual centers (`(x, y, z) * CellSize`), so recovering a voxel index from a sample point rounds to the nearest center rather than flooring into a corner-aligned cell.
+- Surface Picking: The outer AABB shell alone isn't enough — from Top View the entry face is always the topmost, near-permanently-dry layer (gravity only pulls moisture down), so a naive entry-point pick would edit an invisible, empty cell no matter where the visible water actually is. Instead the ray marches inward from the entry point in `CellSize * 0.25` steps and stops at the first cell whose `Moisture` is at or above `MoistureVisibilityThreshold` — i.e. the first cell actually rendered by the debug visualization. If the whole ray path through the grid is dry, it falls back to the entry cell so Add Water can still seed the first drop on an empty grid.
+- Left-Click (Add Water): While the left mouse button is held over a valid voxel, writes `Moisture = 100` into that cell.
+- Shift + Left-Click (Drain Water): While Shift is also held, writes `Moisture = 0` instead.
+- Click-and-hold painting: implemented by polling `Input.IsMouseButtonPressed` in `_Process` rather than reacting to discrete button-down events, so holding the button re-resolves and re-applies the edit every frame at no extra cost.
+- Decoupled Architecture: Edits go through `VoxelGrid.TryGetCell`/`TrySetCell`, writing straight into the authoritative `_cells` array. `VoxelInteractor` never touches rendering or the double-buffer swap directly — the next `SimulationTickRate` tick reads the mutated cell like any other CA state and drives the existing persistent mesh instance pool.
+
 ## 2. Perspective Controller (The CAD Viewport)
 - File Path: game/CadCameraController.cs
 - Mouse Rigging: Right-click drag orbits target, Middle-click drag pans, Mouse wheel zooms.
