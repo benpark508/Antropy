@@ -20,3 +20,9 @@
 - Implemented nutrient advection (leaching), forcing Carbon and Phosphorus to migrate proportionally with active water flow.
 - Built a 6-way nutrient diffusion pass based on concentration gradients (Fick's Law).
 - Gated chemical diffusion to require active moisture presence in both source and destination cells.
+
+## [2026-07-12] - Phase 3B Complete (Mycelial Networks)
+- Implemented a resource-gated fungal growth loop driven by Carbon and Phosphorus consumption.
+- Developed a 6-way weighted probability spreading algorithm that prioritizes damp, nutrient-dense neighbor cells.
+- Enforced a hard environmental constraint preventing fungal expansion into bone-dry (`Moisture = 0`) voxels.
+- Isolated fungal growth simulations into a dedicated loop sweep to prevent early-exit water logic from freezing dry fungal colonies.

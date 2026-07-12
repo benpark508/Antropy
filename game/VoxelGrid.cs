@@ -39,6 +39,26 @@ public partial class VoxelGrid : Node3D
     // migrate through even when no bulk water is flowing.
     [Export] public int MinMoistureForDiffusion = 1;
 
+    // Carbon/Phosphorus a fungal cell must pay out of its own pre-tick
+    // stock every tick just to stay alive. Paying both in full is what
+    // "successfully consumed its survival resources" means below — if
+    // either can't be afforded, the colony at that cell starves instead of
+    // merely skipping growth for the tick.
+    [Export] public int FungalCarbonCost = 2;
+    [Export] public int FungalPhosphorusCost = 1;
+
+    // Upper bound on spread probability per neighbor per tick, scaled down
+    // by how favorable (wet + nutrient-rich) that neighbor actually is.
+    [Export] public float FungalBaseSpreadChance = 0.15f;
+
+    // Relative weight of a neighbor's moisture vs. its Carbon+Phosphorus
+    // when scoring how attractive it is to colonize. Combined as a
+    // weighted average in [0, 1] rather than multiplied, so a neighbor
+    // that's rich in one but middling in the other still gets a fair
+    // chance instead of being crushed to near-zero.
+    [Export] public float FungalMoistureWeight = 0.6f;
+    [Export] public float FungalNutrientWeight = 0.4f;
+
     private VoxelCell[] _cells;
 
     // Write target for the tick currently being computed. Every read during
@@ -54,10 +74,14 @@ public partial class VoxelGrid : Node3D
 
     private MeshInstance3D[] _debugInstances;
 
+    private RandomNumberGenerator _fungalRng;
+
     public override void _Ready()
     {
         _cells = new VoxelCell[Width * Height * Depth];
         _cellsBuffer = new VoxelCell[Width * Height * Depth];
+        _fungalRng = new RandomNumberGenerator();
+        _fungalRng.Randomize();
         PopulateBaseline();
         SpawnDebugVisualization();
     }
@@ -212,6 +236,15 @@ public partial class VoxelGrid : Node3D
             }
         }
 
+        // Fungal growth runs as its own pass rather than being folded into
+        // the loop above: that loop's `if (moisture <= 0) continue` is a
+        // valid short-circuit for water/diffusion (both are about THIS
+        // cell's own moisture), but fungal survival depends only on this
+        // cell's Carbon/Phosphorus stock, not its moisture — a colony
+        // sitting in a voxel gravity just drained dry must still be
+        // evaluated, so it needs an unconditional sweep of its own.
+        SimulateFungalGrowth();
+
         // Horizontal spreading and diffusion don't check a destination's
         // headroom against concurrent inflow from its other neighbors, so
         // clamp as a safety net before the buffer becomes the new
@@ -309,6 +342,82 @@ public partial class VoxelGrid : Node3D
             return 0;
 
         return Mathf.RoundToInt(gradient * NutrientDiffusionRate);
+    }
+
+    // Resource-gated fungal expansion: every fungal cell first pays its
+    // upkeep cost out of its own pre-tick Carbon/Phosphorus (read from
+    // _cells) or starves, then — only if it paid — rolls a spread chance
+    // against each of its 6 neighbors, written to _cellsBuffer. Runs as an
+    // unconditional sweep over the whole grid, independent of the
+    // moisture-gated water/diffusion loop above.
+    private void SimulateFungalGrowth()
+    {
+        for (int z = 0; z < Depth; z++)
+        {
+            for (int y = 0; y < Height; y++)
+            {
+                for (int x = 0; x < Width; x++)
+                {
+                    int index = GetIndex(x, y, z);
+                    if (!_cells[index].FungalPresence)
+                        continue;
+
+                    int carbon = _cells[index].Carbon;
+                    int phosphorus = _cells[index].Phosphorus;
+
+                    bool paidUpkeep = carbon >= FungalCarbonCost && phosphorus >= FungalPhosphorusCost;
+                    if (!paidUpkeep)
+                    {
+                        // Starvation: couldn't afford survival cost this tick.
+                        _cellsBuffer[index].FungalPresence = false;
+                        continue;
+                    }
+
+                    _cellsBuffer[index].Carbon -= FungalCarbonCost;
+                    _cellsBuffer[index].Phosphorus -= FungalPhosphorusCost;
+
+                    TrySpreadToNeighbor(x - 1, y, z);
+                    TrySpreadToNeighbor(x + 1, y, z);
+                    TrySpreadToNeighbor(x, y - 1, z);
+                    TrySpreadToNeighbor(x, y + 1, z);
+                    TrySpreadToNeighbor(x, y, z - 1);
+                    TrySpreadToNeighbor(x, y, z + 1);
+                }
+            }
+        }
+    }
+
+    // Rolls a resource-weighted chance for a surviving fungal cell to
+    // spread FungalPresence into one neighbor. Reads exclusively from
+    // _cells so every source cell this tick scores neighbors against the
+    // same pre-tick snapshot; only ever targets a neighbor that was NOT
+    // already fungal in that snapshot, which is what keeps this safe to
+    // call in any iteration order against a starvation pass that only ever
+    // touches cells that WERE already fungal in the snapshot — the two
+    // never write to the same cell, so there's no order-dependent race.
+    private void TrySpreadToNeighbor(int nx, int ny, int nz)
+    {
+        if (!IsInBounds(nx, ny, nz))
+            return;
+
+        int neighborIndex = GetIndex(nx, ny, nz);
+        if (_cells[neighborIndex].FungalPresence)
+            return;
+
+        int neighborMoisture = _cells[neighborIndex].Moisture;
+        if (neighborMoisture <= 0)
+            return;
+
+        float moistureFactor = (float)neighborMoisture / MaxMoisture;
+        float nutrientFactor = (_cells[neighborIndex].Carbon + _cells[neighborIndex].Phosphorus) / (float)(2 * MaxNutrient);
+        float weight = (moistureFactor * FungalMoistureWeight + nutrientFactor * FungalNutrientWeight)
+            / (FungalMoistureWeight + FungalNutrientWeight);
+
+        float spreadChance = Mathf.Clamp(FungalBaseSpreadChance * weight, 0f, 1f);
+        if (_fungalRng.Randf() < spreadChance)
+        {
+            _cellsBuffer[neighborIndex].FungalPresence = true;
+        }
     }
 
     private void PopulateBaseline()
