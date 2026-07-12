@@ -1,0 +1,12 @@
+# Godot engine artifacts
+game/.godot/
+game/.mono/
+
+# C# build outputs
+game/[Bb]in/
+game/[Oo]bj/
+
+# Personal workspace data
+.vscode/
+game/*.sln
+game/*.csproj
