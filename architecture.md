@@ -1,53 +1,55 @@
 # Antropy - Global Architecture Blueprint
 
-## 1. System Matrix Layout (The Soil Grid)
-- Dimensions: 20x20x20 voxel grid.
-- File Path: game/VoxelGrid.cs
-- Memory Layout: Flattened 1D array (`VoxelCell[]`) mapped to 3D space coordinates: `index = x + (y * width) + (z * width * height)`.
-- Cell Data Struct (`VoxelCell`):
-  * int Moisture (0 to 100)
-  * int Carbon (0 to 100)
-  * int Phosphorus (0 to 100)
-  * bool FungalPresence
-  * Carbon/Phosphorus range clamp shared with Moisture's `MaxMoisture` value via a parallel `MaxNutrient = 100` constant.
+## 1. Grid & Cell Model
+- 100x50 2D grid (`Width x Height`), one `VoxelCell` per tile, flattened to `index = x + y * Width`. File: `game/VoxelGrid.cs`.
+- `CellType`: `Solid` (earth, rows `0..44`) or `Air` (sky, rows `45..49`). `SurfaceRow = Height - AirRows = 45` is the shared boundary constant.
+- `VoxelCell`: `Type`, `Water` (0-`MaxWater`=100), `Carbon` (0-`MaxNutrient`=100), `Phosphorus` (0-`MaxNutrient`=100), `FungalPresence`. All numeric fields are `float`.
+- `PopulateBaseline()` starts every cell dry (`Water = 0`); `InitializeSoilNutrients()` stratifies Carbon/Phosphorus afterward (Section 7).
 
-## 1a. Mouse Interaction Brush (Phase 2B)
-- File Path: game/VoxelInteractor.cs
-- Ray-to-Grid Intersection: Every frame, resolves `GetViewport().GetCamera3D().ProjectRayOrigin/Normal()` for the current mouse position, transforms the ray into `VoxelGrid`'s local space, and intersects it against the grid's AABB via the slab method. The AABB is built around the debug mesh instances' actual centers (`(x, y, z) * CellSize`), so recovering a voxel index from a sample point rounds to the nearest center rather than flooring into a corner-aligned cell.
-- Surface Picking: The outer AABB shell alone isn't enough — from Top View the entry face is always the topmost, near-permanently-dry layer (gravity only pulls moisture down), so a naive entry-point pick would edit an invisible, empty cell no matter where the visible water actually is. Instead the ray marches inward from the entry point in `CellSize * 0.25` steps and stops at the first cell whose `Moisture` is at or above `MoistureVisibilityThreshold` — i.e. the first cell actually rendered by the debug visualization. If the whole ray path through the grid is dry, it falls back to the entry cell so Add Water can still seed the first drop on an empty grid.
-- Left-Click (Add Water): While the left mouse button is held over a valid voxel, writes `Moisture = 100` into that cell.
-- Shift + Left-Click (Drain Water): While Shift is also held, writes `Moisture = 0` instead.
-- Click-and-hold painting: implemented by polling `Input.IsMouseButtonPressed` in `_Process` rather than reacting to discrete button-down events, so holding the button re-resolves and re-applies the edit every frame at no extra cost.
-- Decoupled Architecture: Edits go through `VoxelGrid.TryGetCell`/`TrySetCell`, writing straight into the authoritative `_cells` array. `VoxelInteractor` never touches rendering or the double-buffer swap directly — the next `SimulationTickRate` tick reads the mutated cell like any other CA state and drives the existing persistent mesh instance pool.
+## 2. Scene & Rendering
+- Native Godot 2D throughout — no 3D nodes anywhere in the project.
+- `VoxelGrid` (`Node2D`) owns the simulation only; it resolves a sibling `MultiMeshInstance2D` (`MultiMeshRendererPath`) and pushes `SetInstanceTransform2D`/`SetInstanceColor` into it rather than being the renderer itself.
+- Instances sit at `(x * TileSize + halfTile, RowToScreenY(y, TileSize) + halfTile)`: `RowToScreenY`/`ScreenYToRow` are the single shared conversion between the simulation's Y-up row index and Godot 2D's Y-down screen space (used by both rendering and mouse picking); the `+ halfTile` offset centers each `QuadMesh` (which is origin-centered) inside the `TileSize` bucket picking assumes.
+- `FarmCameraController` (`Camera2D`) is a standalone pan/zoom rig: Right-click drag or WASD/Arrows smoothly pan (`Position.Lerp`), mouse wheel smoothly zooms (`Zoom.Lerp`, clamped `MinZoom`-`MaxZoom`). `GridPixelSize` centers its starting position and must be kept in sync by hand with `Width/Height * TileSize`.
 
-## 2. Perspective Controller (The CAD Viewport)
-- File Path: game/CadCameraController.cs
-- Mouse Rigging: Right-click drag orbits target, Middle-click drag pans, Mouse wheel zooms.
-- View Snapping: Key 1 (Front View), Key 2 (Top View), Key 3 (Side View). 
-- Projection Mode: Always Perspective. Hotkey snaps only change yaw/pitch (never the projection mode), so resuming mouse orbit from a snapped view never alters the render output.
+## 3. Mouse Interaction (`VoxelInteractor.cs`, `Node2D`)
+- Picking: `GetGlobalMousePosition()` (Camera2D-aware) → grid cell via floor-division on X and `ScreenYToRow` on Y. No raycasting anywhere in the pipeline.
+- **Left-Click**: rains onto the highest `Solid` row in the hovered column (`Water = MaxWater`) — water then has to percolate down naturally, not injected into a mid-column tunnel.
+- **Shift + Left-Click (Erase)**: converts the hovered cell to `Air`, zeroing `Water`/`Carbon`/`Phosphorus`/`FungalPresence`.
+- **Ctrl + Left-Click (Fill)**: inverse of Erase — converts the hovered cell back to blank `Solid`, so digging is reversible.
+- **C / P / F (held)**: force-sets Carbon/Phosphorus to max or `FungalPresence` to true on the hovered cell — dev-only, bypasses all CA rules.
+- **Left-Click (press)**: edge-triggered console log of the hovered cell's full state.
+- All edits go through `VoxelGrid.TryGetCell`/`TrySetCell`; the next `SimulationTickRate` tick picks up the change like any CA-driven one.
 
-## 3. Water Cellular Automata (Phase 2A)
-- File Path: game/VoxelGrid.cs
-- Centralized Simulation Tick: A `SimulationTickRate` export (default 0.1s) accumulates `_Process` delta time and fires `SimulateWaterFlow()` on fixed intervals, decoupling flow speed from framerate.
-- Strict Double-Buffered State: `_cells` (last settled state) and `_cellsBuffer` (write target) are two persistent flat arrays, never reallocated per tick. Every tick reads exclusively from `_cells` and writes exclusively to `_cellsBuffer`, then the two references are swapped. This guarantees a cell can never consume moisture produced earlier in the same tick, preventing directional loop bias (water "teleporting" across the grid in one frame because the update order happened to run downhill).
-- Water Flow Rules (evaluated per cell from the read buffer, applied as deltas to the write buffer):
-  1. **Gravity**: A cell attempts to push its full moisture to `(x, y-1, z)`, capped by that neighbor's remaining capacity (`MaxMoisture - neighborMoisture`).
-  2. **Horizontal Equalization**: Any moisture that couldn't go down (off-grid at `y=0`, or the cell below is saturated) is split evenly across whichever in-bounds N/S/E/W neighbors exist (mapped to Z-/Z+/X+/X-).
-  3. **Safety Clamp**: After all cells are processed, the write buffer is clamped to `[0, MaxMoisture]` to guard against concurrent horizontal inflows stacking above capacity.
-- Debug Visualization — MultiMesh Rendering (Phase 4): A single `MultiMeshInstance3D`/`MultiMesh` pair (one shared `BoxMesh`, one shared `StandardMaterial3D`) replaces the earlier per-cell `MeshInstance3D` pool, collapsing 8,000 draw calls and 8,000 material instances into one GPU instance draw. Per-cell `Transform3D` is written once at spawn since grid geometry never changes; each simulation tick only calls `MultiMesh.SetInstanceColor` per cell. Because `MultiMesh` instances have no per-instance `Visible` flag, "invisible" (below `MoistureVisibilityThreshold`) is expressed as alpha `0` against the material's `Transparency = Alpha` + `VertexColorUseAsAlbedo = true` setup, rather than a toggled bool. This is purely a rendering-layer change — `VoxelInteractor`'s raycast derives the grid's AABB analytically from `CellSize`/`Width`/`Height`/`Depth` and never touched the mesh pool, so the double-buffered simulation and mouse interaction are unaffected.
+## 4. Fluid Engine
+- File: `game/VoxelGrid.cs`, `SimulateFluidFlow()`, called on a fixed `SimulationTickRate` (default 0.1s). Strictly double-buffered: every tick reads only `_cells` and writes only `_cellsBuffer`, then swaps.
+- Behavior dispatches on `CellType`; `Solid` cells further split their water into a retained baseline and a movable excess.
+  - **Field Capacity**: water below `SoilFieldCapacity` (30) never moves; only `movableWater = max(0, water - SoilFieldCapacity)` is eligible to flow. Keeps soil permanently damp after rain instead of draining to zero.
+  - **Ground Percolation** (Solid → Solid below): moves `PercolationRate` (0.2) of `movableWater` per tick, capped by the neighbor's capacity. Carries leached nutrients (Section 5).
+  - **Tunnel Seeping** (Solid → Air, below or beside): moves `TunnelSeepRate` (0.15) of `movableWater` into any adjacent open cavity — down, left, right, all independent and additive. No nutrient leaching.
+  - **Lateral Soil Spread** (Solid → Solid, beside): moves `LateralSpreadRate` (0.1) of the movable-water gradient into a less-saturated `Solid` neighbor, so rain fans out sideways through undisturbed soil, not just at tunnel walls. Carries leached nutrients like percolation.
+  - **Open Fluid Pooling** (`Air`): falls instantly into an `Air` cell below with capacity; if blocked, equalizes sideways with `Air` neighbors at `PoolEqualizationRate` (0.5) toward a flat level.
+  - Every gradient-based rule compares only the higher side's excess, so a neighbor pair can't be double-counted from both directions.
+  - Safety clamp: `Water`/`Carbon`/`Phosphorus` clamped to their valid ranges at the end of every tick.
 
-## 4. Nutrient Diffusion & Leaching (Phase 3A)
-- File Path: game/VoxelGrid.cs
-- Runs inside the same `SimulateWaterFlow()` tick as the water CA above, against the same `_cells` (read) / `_cellsBuffer` (write) double buffer — no separate tick loop or extra buffer pair.
-- **Leaching (advection)** — `LeachNutrients()`: Whenever gravity or horizontal equalization moves `waterMoved` units of moisture out of a cell (out of that cell's pre-tick `totalMoisture`), a proportional slice of that cell's pre-tick Carbon and Phosphorus rides along into the same destination cell: `leached = round(nutrient * (waterMoved / totalMoisture) * LeachingEfficiency)`. `LeachingEfficiency` (export, default 0.5) models that not all dissolved nutrient is mobile enough to leach out in one tick. Because gravity's `downOutflow` and horizontal's `share` are both fractions of the same original `totalMoisture`, and their sum never exceeds it, total leached nutrient per source cell per tick can't exceed what the cell held.
-- **Diffusion (concentration gradient)** — `DiffuseNutrients()` / `TryDiffuseToNeighbor()`: Runs unconditionally for every cell with any moisture, independent of whether bulk water moved this tick, against all six neighbors (including up/down — the only nutrient pathway that ever crosses upward, since gravity is one-way). Transfer requires both the source and neighbor cell to hold at least `MinMoistureForDiffusion` moisture (export, default 1) to act as the transport medium; a bone-dry cell neither pushes nor receives nutrient via diffusion. Flux is `round((sourceValue - neighborValue) * NutrientDiffusionRate)` (export, default 0.1), computed only when positive — each cell only pushes toward a neighbor it's more concentrated than. Since every pair of neighbors is evaluated from both sides in the same tick against the same pre-tick snapshot, only the higher-concentration side ever produces a positive flux, so a given pair transfers at most once per tick with no double-counting.
-- **Safety Clamp**: The existing end-of-tick clamp pass was extended to also clamp `Carbon`/`Phosphorus` to `[0, MaxNutrient]`, covering the (normally impossible, but rounding-adjacent) case of a cell receiving simultaneous leached + diffused inflow from multiple neighbors in one tick.
+## 5. Nutrients
+- File: `game/VoxelGrid.cs`. Solid-only — nutrients never move through `Air`, which isn't a chemical transport medium in this model.
+- **Leaching**: a proportional slice of Carbon/Phosphorus rides along with any bulk Solid→Solid water transfer (percolation or lateral spread), scaled by `LeachingEfficiency` (0.5).
+- **Diffusion**: independent concentration-gradient equalization between the 4 Solid neighbors, gated by `MinWaterForDiffusion` (1), rate `NutrientDiffusionRate` (0.1).
 
-## 5. Fungal Growth Cellular Automata (Phase 3B)
-- File Path: game/VoxelGrid.cs
-- Runs as its own unconditional sweep (`SimulateFungalGrowth()`), called once per tick from `SimulateWaterFlow()` after the water/leaching/diffusion loop finishes but before the end-of-tick clamp pass. It is deliberately **not** folded into that main loop's per-cell body: the water loop's `if (moisture <= 0) continue` is a valid short-circuit for rules about a cell's own moisture, but fungal survival depends only on the cell's Carbon/Phosphorus stock — a colony sitting in a voxel gravity just drained dry must still be evaluated, so it needs a sweep that isn't moisture-gated.
-- **Resource-Gated Growth**: Every cell with `FungalPresence = true` (read from `_cells`) must pay `FungalCarbonCost` (default 2) and `FungalPhosphorusCost` (default 1) out of its own pre-tick Carbon/Phosphorus. If it can afford both, the cost is deducted from `_cellsBuffer` and the colony survives the tick. If it can't afford either, the colony **starves** — `_cellsBuffer[index].FungalPresence` is set `false` — rather than merely skipping growth.
-- **Mycelial Expansion**: Only a fungal cell that successfully paid its upkeep this tick rolls a spread attempt against each of its 6 neighbors (`TrySpreadToNeighbor`).
-- **Resource-Weighted Gradients**: A neighbor with `Moisture = 0` is refused outright (hard gate, no roll at all). Otherwise the neighbor's attractiveness is scored as a weighted average of its moisture fraction and its Carbon+Phosphorus fraction — `FungalMoistureWeight` (default 0.6) and `FungalNutrientWeight` (default 0.4) — normalized to `[0, 1]` so a neighbor strong in only one dimension still gets a fair (not crushed-to-zero) chance. That score multiplies `FungalBaseSpreadChance` (default 0.15) to get the final per-neighbor probability, rolled against a persistent `_fungalRng`.
-- **Race-Free by Construction, Not by Ordering**: `TrySpreadToNeighbor` only ever targets a neighbor whose `_cells` (pre-tick) `FungalPresence` was `false`, while starvation only ever touches a cell whose `_cells` `FungalPresence` was `true`. These two write conditions partition the grid — no cell can be targeted by both in the same tick — so the outcome is independent of iteration order, and two different source cells spreading into the same target neighbor just both idempotently write `true`.
-- **Strict Double-Buffering**: Like every other rule in this file, all reads are against `_cells` (last settled state) and all writes land in `_cellsBuffer`; the existing whole-array swap and Carbon/Phosphorus clamp at the end of `SimulateWaterFlow()` cover fungal-driven nutrient deltas with no separate buffer pair or clamp pass needed.
+## 6. Fungal Growth
+- File: `game/VoxelGrid.cs`, `SimulateFungalGrowth()` — its own sweep after the fluid pass, since survival depends on Carbon/Phosphorus, not water.
+- Each fungal cell pays `FungalCarbonCost` (2) / `FungalPhosphorusCost` (1) per tick or starves; a surviving cell rolls a spread chance against each of its 4 neighbors.
+- Spread chance = `FungalBaseSpreadChance` (0.15) × a weighted average of the neighbor's water and nutrient fractions (`FungalMoistureWeight` 0.6 / `FungalNutrientWeight` 0.4). A bone-dry neighbor (`Water = 0`, `Solid` or `Air`) is refused outright.
+
+## 7. Visualization & Diagnostics
+- `ColorMode` (`,` Water / `.` Nutrient / `/` Fungus) selects what `ComputeInstanceColor()` maps to per-instance color.
+- `Solid`: continuous brown→near-black gradient by water saturation in Water mode; flat baseline brown in Nutrient/Fungus modes when inactive.
+- `Air`: transparent when dry (faint sky tint within the original sky band), opaque blue pool (color and alpha both scaling with fill) once wet.
+- Window title bar shows live `Water`/`Carbon`/`Phosphorus`/fungal-cell-count totals each tick as a mass-conservation sanity check.
+
+## 8. Ecosystem Stratification
+- File: `game/VoxelGrid.cs`, `InitializeSoilNutrients()`.
+- Top 3 `Solid` rows (`42-44`): Carbon `60-80` (organic layer).
+- Middle `Solid` rows (`6-41`): neutral, zeroed.
+- Bottom 6 `Solid` rows (`0-5`, bedrock): 6 randomized Phosphorus clusters (radius 6, intensity `60-100`, radial falloff, blended via `Max` where they overlap).

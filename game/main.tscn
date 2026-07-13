@@ -1,17 +1,20 @@
 [gd_scene format=3 uid="uid://buaq673iyr04d"]
 
-[ext_resource type="Script" uid="uid://bpcxxcawrss5v" path="res://VoxelGrid.cs" id="1_0xm2m"]
-[ext_resource type="Script" uid="uid://ct5vkx5x3i4h2" path="res://CadCameraController.cs" id="2_h2yge"]
-[ext_resource type="Script" path="res://VoxelInteractor.cs" id="3_ai9k7"]
+[ext_resource type="Script" path="res://VoxelGrid.cs" id="1_0xm2m"]
+[ext_resource type="Script" path="res://FarmCameraController.cs" id="2_h2yge"]
+[ext_resource type="Script" uid="uid://c5shxjttnmpmw" path="res://VoxelInteractor.cs" id="3_ai9k7"]
 
-[node name="Main" type="Node3D" unique_id=1168331659]
+[node name="Main" type="Node2D" unique_id=1168331659]
 
-[node name="VoxelGrid" type="Node3D" parent="." unique_id=1463207766]
+[node name="VoxelGrid" type="Node2D" parent="."]
 script = ExtResource("1_0xm2m")
+MultiMeshRendererPath = NodePath("MultiMeshInstance2D")
 
-[node name="Camera3D" type="Camera3D" parent="." unique_id=695674496]
-script = ExtResource("2_h2yge")
+[node name="MultiMeshInstance2D" type="MultiMeshInstance2D" parent="VoxelGrid" unique_id=792069894]
 
-[node name="VoxelInteractor" type="Node" parent="."]
+[node name="VoxelInteractor" type="Node2D" parent="." unique_id=593587811]
 script = ExtResource("3_ai9k7")
 VoxelGridPath = NodePath("../VoxelGrid")
+
+[node name="Camera2D" type="Camera2D" parent="." unique_id=1534686899]
+script = ExtResource("2_h2yge")

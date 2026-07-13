@@ -1,16 +1,23 @@
 using Godot;
 
-// Left-click brush for stress-testing the water CA: raycasts the mouse
-// against the VoxelGrid's spatial bounds and writes Moisture directly into
-// the grid's authoritative _cells array via TryGetCell/TrySetCell. This
-// node never touches rendering — the existing SimulationTickRate loop in
-// VoxelGrid picks up the mutated cell on its next tick and drives the
-// persistent mesh instance pool exactly like a CA-generated change would.
-public partial class VoxelInteractor : Node
+// Mouse-driven dev tooling for the hybrid 2D cross-section CA: reads the
+// mouse's native 2D canvas position directly (no raycasting or viewport
+// projection needed on a flat Godot 2D scene) and writes straight into
+// VoxelGrid's authoritative _cells array via TryGetCell/TrySetCell. This
+// node never touches rendering -- the existing SimulationTickRate loop in
+// VoxelGrid picks up any mutated cell on its next tick and drives the
+// MultiMesh visualization exactly like a CA-generated change would.
+public partial class VoxelInteractor : Node2D
 {
     [Export] public NodePath VoxelGridPath;
 
     private VoxelGrid _voxelGrid;
+
+    // Cell currently under the mouse cursor, refreshed once per frame in
+    // _Process and shared by the resource brush (polled, hold-to-apply)
+    // and the click logger (_Input, fires once per press).
+    private bool _hasHoveredVoxel;
+    private int _hoverX, _hoverY;
 
     public override void _Ready()
     {
@@ -19,146 +26,182 @@ public partial class VoxelInteractor : Node
 
     public override void _Process(double delta)
     {
+        _hasHoveredVoxel = TryResolveVoxel(out _hoverX, out _hoverY);
+        if (!_hasHoveredVoxel)
+            return;
+
+        // Developer keys (C, P, F) still target deep internal coordinates --
+        // i.e. whatever cell the mouse is currently hovering, same as the
+        // erase brush below, not the surface-clamped rain brush.
+        ApplyDeveloperResourceBrush();
+
         // Polling (rather than reacting only to button-down events) is what
         // makes click-and-hold painting free: every frame the button is
-        // down, we just re-resolve the ray and re-apply the same edit.
+        // down, we just re-apply the same edit to the already-resolved
+        // hover cell.
         if (!Input.IsMouseButtonPressed(MouseButton.Left))
             return;
 
-        Camera3D camera = GetViewport().GetCamera3D();
-        if (camera == null)
+        if (Input.IsKeyPressed(Key.Shift))
+        {
+            ApplyEraseBrush();
             return;
+        }
 
-        Vector2 mousePosition = GetViewport().GetMousePosition();
-        Vector3 rayOrigin = camera.ProjectRayOrigin(mousePosition);
-        Vector3 rayDirection = camera.ProjectRayNormal(mousePosition);
-
-        if (!TryResolveVoxel(rayOrigin, rayDirection, out int x, out int y, out int z))
+        if (Input.IsKeyPressed(Key.Ctrl))
+        {
+            ApplyFillBrush();
             return;
+        }
 
-        if (!_voxelGrid.TryGetCell(x, y, z, out VoxelCell cell))
-            return;
-
-        bool drain = Input.IsKeyPressed(Key.Shift);
-        cell.Moisture = drain ? 0 : VoxelGrid.MaxMoisture;
-        _voxelGrid.TrySetCell(x, y, z, cell);
+        ApplyWaterBrush();
     }
 
-    // Projects the mouse ray into the VoxelGrid's local space, intersects it
-    // against the grid's AABB, then marches inward from the entry point
-    // looking for the first cell that's actually rendered (Moisture at or
-    // above the debug-viz threshold). This is what lets a Top View click
-    // reach through dry ceiling layers down to water the user can actually
-    // see, instead of always editing the outermost shell voxel. If the
-    // entire ray path through the grid is dry, falls back to the entry
-    // cell so Add Water can still seed the first drop on an empty grid.
-    private bool TryResolveVoxel(Vector3 rayOrigin, Vector3 rayDirection, out int x, out int y, out int z)
+    // Fires once per left-click press (not every frame the button is held,
+    // unlike the brushes above) so the console gets exactly one clean
+    // summary line per click instead of being spammed for the duration of
+    // a held click.
+    public override void _Input(InputEvent @event)
     {
-        x = y = z = 0;
+        if (@event is not InputEventMouseButton mouseButton
+            || mouseButton.ButtonIndex != MouseButton.Left
+            || !mouseButton.Pressed)
+            return;
 
-        Transform3D gridTransform = _voxelGrid.GlobalTransform;
-        Vector3 localOrigin = gridTransform.AffineInverse() * rayOrigin;
-        Vector3 localDirection = (gridTransform.Basis.Inverse() * rayDirection).Normalized();
+        LogVoxelInspection();
+    }
 
-        float cellSize = _voxelGrid.CellSize;
-        float half = cellSize * 0.5f;
-        Vector3 boundsMin = new Vector3(-half, -half, -half);
-        Vector3 boundsMax = new Vector3(
-            (VoxelGrid.Width - 1) * cellSize + half,
-            (VoxelGrid.Height - 1) * cellSize + half,
-            (VoxelGrid.Depth - 1) * cellSize + half);
+    private void LogVoxelInspection()
+    {
+        if (!_hasHoveredVoxel)
+            return;
 
-        if (!TryIntersectAabb(localOrigin, localDirection, boundsMin, boundsMax, out float tEntry, out float tExit))
-            return false;
+        if (!_voxelGrid.TryGetCell(_hoverX, _hoverY, out VoxelCell cell))
+            return;
 
-        // Nudge both ends a hair inward so floating-point error at the
-        // boundary faces can't round a sample outside the grid.
-        float t = tEntry + 0.001f;
-        float exit = tExit - 0.001f;
-        float step = cellSize * 0.25f;
+        GD.Print($"Cell ({_hoverX}, {_hoverY}) -> Type={cell.Type} Water={cell.Water:F1} Carbon={cell.Carbon:F1} Phosphorus={cell.Phosphorus:F1} Fungus={cell.FungalPresence}");
+    }
 
-        bool haveEntryCell = false;
-        int entryX = 0, entryY = 0, entryZ = 0;
-        int lastX = int.MinValue, lastY = int.MinValue, lastZ = int.MinValue;
+    // Water Brush: adding water always deposits onto the highest Solid cell
+    // in the hovered column (the ground surface), not the hovered depth, so
+    // it has to filter down through Ground Percolation like rain instead of
+    // being injected directly into a mid-column tunnel.
+    private void ApplyWaterBrush()
+    {
+        if (!TryFindHighestSolidRow(_hoverX, out int surfaceY))
+            return;
 
-        for (; t <= exit; t += step)
+        if (!_voxelGrid.TryGetCell(_hoverX, surfaceY, out VoxelCell cell))
+            return;
+
+        cell.Water = VoxelGrid.MaxWater;
+        _voxelGrid.TrySetCell(_hoverX, surfaceY, cell);
+    }
+
+    private bool TryFindHighestSolidRow(int x, out int y)
+    {
+        for (int candidate = VoxelGrid.Height - 1; candidate >= 0; candidate--)
         {
-            Vector3 point = localOrigin + localDirection * t;
-            int cx = Mathf.Clamp(Mathf.RoundToInt(point.X / cellSize), 0, VoxelGrid.Width - 1);
-            int cy = Mathf.Clamp(Mathf.RoundToInt(point.Y / cellSize), 0, VoxelGrid.Height - 1);
-            int cz = Mathf.Clamp(Mathf.RoundToInt(point.Z / cellSize), 0, VoxelGrid.Depth - 1);
-
-            if (cx == lastX && cy == lastY && cz == lastZ)
-                continue;
-            lastX = cx; lastY = cy; lastZ = cz;
-
-            if (!haveEntryCell)
+            if (_voxelGrid.TryGetCell(x, candidate, out VoxelCell cell) && cell.Type == CellType.Solid)
             {
-                entryX = cx; entryY = cy; entryZ = cz;
-                haveEntryCell = true;
-            }
-
-            if (_voxelGrid.TryGetCell(cx, cy, cz, out VoxelCell cell)
-                && cell.Moisture >= _voxelGrid.MoistureVisibilityThreshold)
-            {
-                x = cx; y = cy; z = cz;
+                y = candidate;
                 return true;
             }
         }
 
-        if (!haveEntryCell)
-            return false;
-
-        x = entryX; y = entryY; z = entryZ;
-        return true;
+        y = 0;
+        return false;
     }
 
-    // Standard slab-method ray/AABB intersection. Returns both the entry
-    // and exit distances along the ray (entry clamped to 0 so a ray whose
-    // origin already sits inside the grid still resolves), or false if the
-    // ray misses the box entirely.
-    private static bool TryIntersectAabb(Vector3 origin, Vector3 direction, Vector3 boundsMin, Vector3 boundsMax, out float tEntry, out float tExit)
+    // Erase Tool: carves a tunnel by converting the hovered cell to Air and
+    // zeroing its resources, letting a developer manually open cavities to
+    // test Open Fluid Pooling and Tunnel Seeping.
+    private void ApplyEraseBrush()
     {
-        float tMin = 0.0f;
-        float tMax = float.PositiveInfinity;
+        if (!_voxelGrid.TryGetCell(_hoverX, _hoverY, out VoxelCell cell))
+            return;
 
-        for (int axis = 0; axis < 3; axis++)
+        cell.Type = CellType.Air;
+        cell.Water = 0f;
+        cell.Carbon = 0f;
+        cell.Phosphorus = 0f;
+        cell.FungalPresence = false;
+        _voxelGrid.TrySetCell(_hoverX, _hoverY, cell);
+    }
+
+    // Fill Tool: the inverse of Erase -- converts the hovered cell back to
+    // blank Solid earth (zeroed, not restored to whatever it held before),
+    // so carving a tunnel to test pooling is reversible without restarting
+    // the whole simulation to undo a mistake.
+    private void ApplyFillBrush()
+    {
+        if (!_voxelGrid.TryGetCell(_hoverX, _hoverY, out VoxelCell cell))
+            return;
+
+        cell.Type = CellType.Solid;
+        cell.Water = 0f;
+        cell.Carbon = 0f;
+        cell.Phosphorus = 0f;
+        cell.FungalPresence = false;
+        _voxelGrid.TrySetCell(_hoverX, _hoverY, cell);
+    }
+
+    // Dev-only diagnostic brush: while hovering a resolved cell, holding
+    // C/P/F force-sets Carbon/Phosphorus to max or FungalPresence to true,
+    // bypassing CA rules entirely. Exists purely to hand-seed test states
+    // (e.g. force-feed a starving colony, or seed fungus somewhere the
+    // spread roll would never reach) without waiting on the simulation.
+    private void ApplyDeveloperResourceBrush()
+    {
+        if (!_voxelGrid.TryGetCell(_hoverX, _hoverY, out VoxelCell cell))
+            return;
+
+        bool changed = false;
+
+        if (Input.IsKeyPressed(Key.C))
         {
-            float o = origin[axis];
-            float d = direction[axis];
-            float min = boundsMin[axis];
-            float max = boundsMax[axis];
-
-            if (Mathf.Abs(d) < 1e-8f)
-            {
-                if (o < min || o > max)
-                {
-                    tEntry = 0.0f;
-                    tExit = 0.0f;
-                    return false;
-                }
-                continue;
-            }
-
-            float inv = 1.0f / d;
-            float t1 = (min - o) * inv;
-            float t2 = (max - o) * inv;
-            if (t1 > t2)
-                (t1, t2) = (t2, t1);
-
-            tMin = Mathf.Max(tMin, t1);
-            tMax = Mathf.Min(tMax, t2);
-
-            if (tMin > tMax)
-            {
-                tEntry = 0.0f;
-                tExit = 0.0f;
-                return false;
-            }
+            cell.Carbon = VoxelGrid.MaxNutrient;
+            changed = true;
         }
 
-        tEntry = tMin;
-        tExit = tMax;
+        if (Input.IsKeyPressed(Key.P))
+        {
+            cell.Phosphorus = VoxelGrid.MaxNutrient;
+            changed = true;
+        }
+
+        if (Input.IsKeyPressed(Key.F))
+        {
+            cell.FungalPresence = true;
+            changed = true;
+        }
+
+        if (changed)
+            _voxelGrid.TrySetCell(_hoverX, _hoverY, cell);
+    }
+
+    // Reads the mouse's real-time position on the native 2D canvas
+    // (GetGlobalMousePosition() already accounts for the active Camera2D's
+    // pan/zoom) and converts it to an integer grid cell -- no raycasting,
+    // ray-plane math, or viewport projection needed on a flat Godot 2D
+    // scene. The Y axis goes through VoxelGrid.ScreenYToRow rather than a
+    // raw division, since screen Y grows downward while the simulation's
+    // row index grows upward (see VoxelGrid.RowToScreenY/ScreenYToRow).
+    private bool TryResolveVoxel(out int x, out int y)
+    {
+        Vector2 mousePosition = GetGlobalMousePosition();
+
+        int gridX = Mathf.FloorToInt(mousePosition.X / _voxelGrid.TileSize);
+        int gridY = VoxelGrid.ScreenYToRow(mousePosition.Y, _voxelGrid.TileSize);
+
+        if (!VoxelGrid.IsInBounds(gridX, gridY))
+        {
+            x = y = 0;
+            return false;
+        }
+
+        x = gridX;
+        y = gridY;
         return true;
     }
 }
